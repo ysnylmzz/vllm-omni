@@ -14,8 +14,9 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel
+from vllm_omni.platforms import current_omni_platform
 
-from .attention import TaoMateH3StreamingAttention
+from .attention import TaoMateH3StreamingAttention, resolve_npu_attention_kernel
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -122,9 +123,17 @@ class TaoMateH3DiTModel(MiniMaxH3DiTModel):
             diffusers_weights=diffusers_weights,
             attention_cls=TaoMateH3StreamingAttention,
         )
+        # The dense kernel of the streaming path on Ascend; other platforms
+        # keep FlashAttention-3 / SDPA and never read it.
+        npu_kernel = "sdpa"
+        if current_omni_platform.is_npu():
+            model_config = dict(getattr(od_config, "model_config", None) or {})
+            npu_kernel = resolve_npu_attention_kernel(model_config.get("taomate_h3_npu_attention"))
+            logger.info("TaoMate-H3 streaming attention on NPU uses the %r kernel", npu_kernel)
         for index, block in enumerate(self.blocks):
             block.attn.layer_name = f"blocks.{index}.attn"
             block.attn.layer_index = index
+            block.attn.npu_attention_kernel = npu_kernel
 
     @property
     def streaming_local_heads(self) -> int:

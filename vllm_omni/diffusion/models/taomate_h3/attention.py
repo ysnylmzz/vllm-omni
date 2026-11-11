@@ -22,10 +22,17 @@ full-sequence rows for this rank's head shard, and gathers back before the
 output projection. Attention runs as dense FlashAttention-3 (``fa3_fwd_interface``
 or ``flash_attn_interface``), the same kernel family as the release; SDPA is the
 CPU / no-FA fallback.
+
+On Ascend NPU the dense kernel is ``torch_npu.npu_fusion_attention`` (TND), or
+MindIE-SD ``ascend_laser_attention`` when ``MINDIE_SD_FA_TYPE`` selects it, as
+for the base MiniMax-H3 path. The engine already hands each layer an exact
+contiguous ``[history | media | condition]`` view, so neither kernel needs a
+mask, packed lengths or K/V prefix slicing here.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -37,7 +44,10 @@ import torch
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
 from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNLayout
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D, all_to_all_5D
-from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3Attention
+from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+    MINIMAX_H3_LASER_INPUT_SCALE,
+    MiniMaxH3Attention,
+)
 from vllm_omni.experimental.ar_diffusion.kv_cache.segmented import ARDiffusionSegmentedKVState
 
 
@@ -96,6 +106,84 @@ def _resolve_flash_attention():
         return None
 
 
+# Dense kernels of the streaming path on Ascend NPU. "auto" follows the base
+# MiniMax-H3 convention: laser when MINDIE_SD_FA_TYPE selects it, else fusion
+# attention. "sdpa" keeps the portable fallback for A/B comparison.
+NPU_ATTENTION_KERNELS = ("auto", "fa", "laser", "sdpa")
+_LASER_FA_TYPE = "ascend_laser_attention"
+
+
+def resolve_npu_attention_kernel(value: object = None) -> str:
+    """Resolve ``taomate_h3_npu_attention`` to ``fa``, ``laser`` or ``sdpa``."""
+    kernel = "auto" if value is None else str(value).strip().lower()
+    if kernel not in NPU_ATTENTION_KERNELS:
+        raise ValueError(f"taomate_h3_npu_attention must be one of {NPU_ATTENTION_KERNELS}, got {value!r}")
+    laser_selected = os.environ.get("MINDIE_SD_FA_TYPE") == _LASER_FA_TYPE
+    if kernel == "auto":
+        return "laser" if laser_selected else "fa"
+    if kernel == "laser" and not laser_selected:
+        # MindIE-SD picks the operator from the environment; without it the
+        # call below would run the default fused op under the laser pre-scale.
+        raise ValueError(f"taomate_h3_npu_attention='laser' requires MINDIE_SD_FA_TYPE={_LASER_FA_TYPE}")
+    return kernel
+
+
+def _npu_fusion_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    scale: float,
+) -> torch.Tensor:
+    """``torch_npu.npu_fusion_attention`` over one unmasked TND document."""
+    import torch_npu
+
+    return torch_npu.npu_fusion_attention(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        head_num=int(query.shape[1]),
+        input_layout="TND",
+        actual_seq_qlen=[int(query.shape[0])],
+        actual_seq_kvlen=[int(key.shape[0])],
+        scale=float(scale),
+        keep_prob=1.0,
+    )[0]
+
+
+def _npu_laser_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    scale: float,
+) -> torch.Tensor:
+    """MindIE-SD laser attention with the base H3 fp16-range pre-scale.
+
+    The kernel keeps unscaled QK^T in an fp16 workspace and H3 activations
+    overflow it (see ``MINIMAX_H3_LASER_INPUT_SCALE``). The streaming path
+    bypasses the attention backend that applies the pre-scale for the base
+    model, so it is applied here: q/k/v are divided by a power of two, the
+    kernel scale is multiplied by its square and the output is scaled back.
+    """
+    from mindiesd import attention_forward
+
+    input_scale = float(MINIMAX_H3_LASER_INPUT_SCALE)
+    # MindIE-SD takes BSND input; ``layout`` names the op-internal layout and
+    # laser supports BNSD only.
+    out = attention_forward(
+        (query / input_scale).unsqueeze(0),
+        (key / input_scale).unsqueeze(0),
+        (value / input_scale).unsqueeze(0),
+        attn_mask=None,
+        opt_mode="manual",
+        op_type="fused_attn_score",  # MINDIE_SD_FA_TYPE overrides this
+        layout="BNSD",
+        scale=float(scale) * input_scale**2,
+    )
+    return out.squeeze(0) * input_scale
+
+
 def _dense_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -103,8 +191,13 @@ def _dense_attention(
     *,
     scale: float,
     flash_attn_func,
+    npu_kernel: str = "sdpa",
 ) -> torch.Tensor:
     """Non-causal dense attention over ``[rows, heads, head_dim]`` tensors."""
+    if query.device.type == "npu" and npu_kernel != "sdpa":
+        if npu_kernel == "laser":
+            return _npu_laser_attention(query, key, value, scale=scale)
+        return _npu_fusion_attention(query, key, value, scale=scale)
     if flash_attn_func is not None and query.is_cuda and query.dtype in (torch.bfloat16, torch.float16):
         output = flash_attn_func(
             query.unsqueeze(0),
@@ -127,6 +220,10 @@ def _dense_attention(
 
 class TaoMateH3StreamingAttention(MiniMaxH3Attention):
     """``MiniMaxH3Attention`` with TaoMate's persistent-KV streaming path."""
+
+    # Dense kernel for tensors on an Ascend NPU; the DiT model assigns it from
+    # ``taomate_h3_npu_attention``. Other devices never read it.
+    npu_attention_kernel: str = "sdpa"
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -228,6 +325,7 @@ class TaoMateH3StreamingAttention(MiniMaxH3Attention):
             v_condition,
             scale=scale,
             flash_attn_func=self._flash_attn_func,
+            npu_kernel=self.npu_attention_kernel,
         )
         if m_span is not None:
             q_media = q[m_span[0] : m_span[0] + m_span[1]]
@@ -248,6 +346,7 @@ class TaoMateH3StreamingAttention(MiniMaxH3Attention):
             values,
             scale=scale,
             flash_attn_func=self._flash_attn_func,
+            npu_kernel=self.npu_attention_kernel,
         )
         out = torch.zeros_like(q)
         if c_span is not None:
@@ -265,8 +364,10 @@ class TaoMateH3StreamingAttention(MiniMaxH3Attention):
 
 
 __all__ = [
+    "NPU_ATTENTION_KERNELS",
     "StreamContext",
     "StreamMode",
     "TaoMateH3StreamingAttention",
+    "resolve_npu_attention_kernel",
     "stream_context",
 ]
