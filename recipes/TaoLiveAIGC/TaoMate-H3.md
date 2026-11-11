@@ -74,6 +74,33 @@ Do not increase the decoder tile size: 384/480 px tiles previously produced a vi
 16 px lattice. Keep `taomate_h3_lora_merge: false`: merging into FP8 student weights
 previously erased much of the small adapter delta and blurred the video.
 
+### Ascend 950 (four NPUs, BF16)
+
+> Not yet validated on hardware. This is the Ascend twin of the four-GPU BF16
+> configuration; the two-GPU FP8 configuration has no Ascend counterpart yet.
+
+Prepare the environment as for the base model
+([MiniMax-H3-NPU-950PR.md](../MiniMaxAI/MiniMax-H3-NPU-950PR.md)): the A5 vLLM-Omni
+image with MindIE-SD installed.
+
+```bash
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_NPU_SOCKET_PORT_RANGE="auto"
+
+vllm serve /path/to/MiniMax-H3/FL2VA --omni --trust-remote-code \
+  --deploy-config vllm_omni/deploy/taomate_h3_usp4_realtime_npu.yaml \
+  --lora-path /path/to/TaoMate-H3 --port 8000 \
+  --stage-init-timeout 1800 --init-timeout 2100
+```
+
+Use `taomate_h3_usp4_full_request_npu.yaml` for the `/v1/videos` job API. The
+streaming attention runs `torch_npu.npu_fusion_attention`; set
+`MINDIE_SD_FA_TYPE=ascend_laser_attention` to run MindIE-SD laser attention in
+both the base (teacher, token refiner) and the streaming path, or pin the
+streaming kernel with `taomate_h3_npu_attention`. CUDA graphs, the decode
+overlap and the FP8 activation kernel are CUDA-only and stay off.
+
 The engine performs a throwaway rollout before serving, including in eager mode when
 `ar_diffusion_kv_config.warmup_cudagraph: true`. Four windows cover the teacher's initial
 audio length and the later 198/198/199-latent cycle. Capturing teacher and encoder graphs
@@ -225,6 +252,7 @@ the supplied YAML files enable additional optimizations.
 | `taomate_h3_vae_decoder_tile_overlap_min` | checkpoint: 64 | Minimum tile overlap, a nonnegative multiple of 16. The USP2 config uses 32. |
 | `taomate_h3_vae_stack_tiling` | false | Decode each rank's tiles as a batch to reduce peak memory. |
 | `taomate_h3_fp8_quant_cuda_op` | true | Use vLLM's CUDA activation-quantization kernel for FP8 linears. |
+| `taomate_h3_npu_attention` | `auto` | Ascend only: dense kernel of the streaming attention. `auto` uses laser attention when `MINDIE_SD_FA_TYPE=ascend_laser_attention` and `npu_fusion_attention` otherwise; `fa`, `laser` or `sdpa` pin it. |
 | `taomate_h3_log_timings` | false | Log phase/stage durations; adds device synchronizations. |
 | `taomate_h3_profile_chunk` / `taomate_h3_profile_dir` | unset / `/tmp/taomate_h3_profile` | Profile the selected chunk and write per-rank kernel tables and Chrome traces. |
 

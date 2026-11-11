@@ -1592,3 +1592,136 @@ def test_streaming_attention_preserves_minimax_forward_contract() -> None:
             assert param.default is not Parameter.empty, (
                 f"{name}: streaming-only parameter must have a default so base callers stay valid"
             )
+
+
+# Ascend NPU dense kernels of the streaming attention
+
+
+def _reference_dense_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float) -> torch.Tensor:
+    # [rows, heads, dim] -> per-head softmax(q k^T * scale) v
+    scores = torch.einsum("qhd,khd->hqk", q, k) * scale
+    return torch.einsum("hqk,khd->qhd", scores.softmax(dim=-1), v)
+
+
+def _streaming_qkv() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    generator = torch.Generator().manual_seed(0)
+    q = torch.randn(5, 2, 8, generator=generator)
+    k = torch.randn(11, 2, 8, generator=generator)
+    v = torch.randn(11, 2, 8, generator=generator)
+    return q, k, v
+
+
+@pytest.mark.parametrize(
+    ("value", "fa_type", "expected"),
+    [
+        (None, None, "fa"),
+        ("auto", None, "fa"),
+        ("auto", "ascend_laser_attention", "laser"),
+        (None, "ascend_laser_attention", "laser"),
+        ("FA", "ascend_laser_attention", "fa"),
+        ("laser", "ascend_laser_attention", "laser"),
+        ("sdpa", None, "sdpa"),
+    ],
+)
+def test_npu_attention_kernel_resolution(monkeypatch, value, fa_type, expected) -> None:
+    from vllm_omni.diffusion.models.taomate_h3.attention import resolve_npu_attention_kernel
+
+    if fa_type is None:
+        monkeypatch.delenv("MINDIE_SD_FA_TYPE", raising=False)
+    else:
+        monkeypatch.setenv("MINDIE_SD_FA_TYPE", fa_type)
+    assert resolve_npu_attention_kernel(value) == expected
+
+
+def test_npu_attention_kernel_rejects_unknown_and_unselected_laser(monkeypatch) -> None:
+    from vllm_omni.diffusion.models.taomate_h3.attention import resolve_npu_attention_kernel
+
+    monkeypatch.delenv("MINDIE_SD_FA_TYPE", raising=False)
+    with pytest.raises(ValueError, match="taomate_h3_npu_attention must be one of"):
+        resolve_npu_attention_kernel("flash")
+    # MindIE-SD selects the laser operator from the environment only.
+    with pytest.raises(ValueError, match="requires MINDIE_SD_FA_TYPE"):
+        resolve_npu_attention_kernel("laser")
+
+
+def test_npu_fusion_attention_passes_one_unmasked_tnd_document(monkeypatch) -> None:
+    import sys
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.taomate_h3 import attention as tm_attention
+
+    q, k, v = _streaming_qkv()
+    calls: list[dict] = []
+
+    def npu_fusion_attention(query, key, value, **kwargs):
+        calls.append(kwargs)
+        assert query.is_contiguous() and key.is_contiguous() and value.is_contiguous()
+        return (_reference_dense_attention(query, key, value, kwargs["scale"]), None)
+
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(npu_fusion_attention=npu_fusion_attention))
+    # A strided query, as after the Ulysses exchange's unbind.
+    strided = torch.stack((q, q), dim=1)[:, 1]
+    out = tm_attention._npu_fusion_attention(strided, k, v, scale=0.25)
+    assert calls == [
+        {
+            "head_num": 2,
+            "input_layout": "TND",
+            "actual_seq_qlen": [5],
+            "actual_seq_kvlen": [11],
+            "scale": 0.25,
+            "keep_prob": 1.0,
+        }
+    ]
+    torch.testing.assert_close(out, _reference_dense_attention(q, k, v, 0.25))
+
+
+def test_npu_laser_attention_prescale_is_exact(monkeypatch) -> None:
+    import sys
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_blocks import MINIMAX_H3_LASER_INPUT_SCALE
+    from vllm_omni.diffusion.models.taomate_h3 import attention as tm_attention
+
+    q, k, v = _streaming_qkv()
+    # Outliers in the hundreds: QK^T would leave the fp16 range unscaled.
+    q, k = q * 300.0, k * 300.0
+    seen: dict = {}
+
+    def attention_forward(query, key, value, **kwargs):
+        seen.update(kwargs, shapes=(tuple(query.shape), tuple(key.shape)), amax=float(query.abs().max()))
+        # BSND in, BSND out.
+        return _reference_dense_attention(query[0], key[0], value[0], kwargs["scale"]).unsqueeze(0)
+
+    monkeypatch.setitem(sys.modules, "mindiesd", SimpleNamespace(attention_forward=attention_forward))
+    scale = 8**-0.5
+    out = tm_attention._npu_laser_attention(q, k, v, scale=scale)
+    assert seen["shapes"] == ((1, 5, 2, 8), (1, 11, 2, 8))
+    assert seen["attn_mask"] is None
+    assert seen["layout"] == "BNSD"
+    assert seen["op_type"] == "fused_attn_score"
+    assert seen["scale"] == scale * MINIMAX_H3_LASER_INPUT_SCALE**2
+    assert seen["amax"] == float(q.abs().max()) / MINIMAX_H3_LASER_INPUT_SCALE
+    # A power-of-two pre-scale changes no mantissa: the result is the unscaled attention.
+    torch.testing.assert_close(out, _reference_dense_attention(q, k, v, scale))
+
+
+@pytest.mark.parametrize("kernel", ["fa", "laser", "sdpa"])
+def test_dense_attention_ignores_the_npu_kernel_off_npu(kernel) -> None:
+    from vllm_omni.diffusion.models.taomate_h3.attention import _dense_attention
+
+    q, k, v = _streaming_qkv()
+    out = _dense_attention(q, k, v, scale=0.25, flash_attn_func=None, npu_kernel=kernel)
+    torch.testing.assert_close(out, _reference_dense_attention(q, k, v, 0.25), rtol=1e-5, atol=1e-6)
+
+
+def test_npu_deploy_configs_mirror_the_gpu_ones() -> None:
+    from pathlib import Path
+
+    import yaml
+
+    deploy = Path(__file__).parents[4] / "vllm_omni" / "deploy"
+    for name in ("taomate_h3_usp4_realtime", "taomate_h3_usp4_full_request"):
+        gpu = yaml.safe_load((deploy / f"{name}.yaml").read_text())
+        npu = yaml.safe_load((deploy / f"{name}_npu.yaml").read_text())
+        assert npu["stages"][0]["model_config"].pop("taomate_h3_npu_attention") == "auto"
+        assert npu == gpu

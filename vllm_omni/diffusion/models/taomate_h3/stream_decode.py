@@ -107,10 +107,13 @@ class StreamingVideoDecoder:
         self.latents = visual if self.latents is None else torch.cat((self.latents, visual), dim=2)
         self.total += int(visual.shape[2])
         outputs: list[torch.Tensor] = []
+        # The decoder's linears may be materialized in fp16, as the reference
+        # decode casts them through autocast on every tile; the base pipeline
+        # enters it on Ascend as well (``torch.npu.amp.autocast``).
         autocast = current_omni_platform.create_autocast_context(
             device_type=self.device.type,
             dtype=torch.float16,
-            enabled=self.device.type == "cuda",
+            enabled=self.device.type in ("cuda", "npu"),
         )
         with torch.inference_mode(), autocast:
             while _TOKENS_PER_WINDOW * self.next_window + _WINDOW_TOKENS <= self.total:
