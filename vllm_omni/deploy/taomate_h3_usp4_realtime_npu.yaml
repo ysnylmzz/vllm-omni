@@ -36,7 +36,8 @@ stages:
       taomate_h3_audio_kv_reset_requests: 12
       # Dense kernel of the streaming attention: auto (laser when
       # MINDIE_SD_FA_TYPE=ascend_laser_attention, else npu_fusion_attention),
-      # fa, laser, or sdpa.
+      # fa, laser, or sdpa. Leave MINDIE_SD_FA_TYPE unset on A5 devices: MindIE-SD
+      # remaps laser to fused_attn_score there and the run is slower.
       taomate_h3_npu_attention: auto
       # AR-Diffusion owns persistent AV pages and contiguous attention staging.
       ar_diffusion_kv_config:

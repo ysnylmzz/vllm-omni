@@ -378,13 +378,12 @@ def test_streaming_attention_rejects_vdn_before_running_kernels(vdn_window):
     [
         {"reference_kv_state": object()},
         {"reference_kv_compact": True},
-        {"reference_kv_layer_index": 3},
+        {"reference_kv_state": object(), "reference_kv_layer_index": 3},
     ],
-    ids=["state", "compact", "layer_index"],
+    ids=["state", "compact", "state_and_layer_index"],
 )
 def test_streaming_attention_rejects_reference_kv_reuse(kwargs):
-    """Any reference-KV request inside a streaming context fails fast, including
-    a lone ``reference_kv_layer_index`` that the guard previously ignored."""
+    """A reference-KV state or compaction request inside a streaming context fails fast."""
     from unittest.mock import Mock
 
     from vllm_omni.diffusion.models.taomate_h3.attention import (
@@ -406,6 +405,33 @@ def test_streaming_attention_rejects_reference_kv_reuse(kwargs):
             cu_seqlens=torch.tensor([0, 2]),
             max_seqlen=2,
             **kwargs,
+        )
+
+
+def test_streaming_attention_accepts_the_block_layer_index():
+    """``MiniMaxH3DiTBlock`` always passes its index as ``reference_kv_layer_index``;
+    the index alone passes the reference-KV guard and reaches the next check."""
+    from unittest.mock import Mock
+
+    from vllm_omni.diffusion.models.taomate_h3.attention import (
+        StreamContext,
+        TaoMateH3StreamingAttention,
+        stream_context,
+    )
+
+    attention = object.__new__(TaoMateH3StreamingAttention)
+    nn.Module.__init__(attention)
+    attention.layer_name = "blocks.0.attn"
+    with (
+        stream_context(Mock(spec=StreamContext)),
+        pytest.raises(ValueError, match="requires the phase RoPE table"),
+    ):
+        attention(
+            torch.zeros(2, 4),
+            rope_table=None,
+            cu_seqlens=torch.tensor([0, 2]),
+            max_seqlen=2,
+            reference_kv_layer_index=3,
         )
 
 

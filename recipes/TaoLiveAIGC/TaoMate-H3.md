@@ -76,8 +76,12 @@ previously erased much of the small adapter delta and blurred the video.
 
 ### Ascend 950 (four NPUs, BF16)
 
-> Not yet validated on hardware. This is the Ascend twin of the four-GPU BF16
-> configuration; the two-GPU FP8 configuration has no Ascend counterpart yet.
+> This is the Ascend twin of the four-GPU BF16 configuration; the two-GPU FP8
+> configuration has no Ascend counterpart yet. The realtime configuration was run on
+> four NPUs with an A5 software stack (CANN 9.2.1, torch_npu 2.10.0.post7, MindIE-SD
+> 3.2.0, vLLM 0.33.0): startup rollout and streaming requests completed with video and
+> audio. The output was checked by eye only, not against a CUDA reference, and the
+> full-request configuration was not run.
 
 Prepare the environment as for the base model
 ([MiniMax-H3-NPU-950PR.md](../MiniMaxAI/MiniMax-H3-NPU-950PR.md)): the A5 vLLM-Omni
@@ -95,11 +99,27 @@ vllm serve /path/to/MiniMax-H3/FL2VA --omni --trust-remote-code \
 ```
 
 Use `taomate_h3_usp4_full_request_npu.yaml` for the `/v1/videos` job API. The
-streaming attention runs `torch_npu.npu_fusion_attention`; set
-`MINDIE_SD_FA_TYPE=ascend_laser_attention` to run MindIE-SD laser attention in
-both the base (teacher, token refiner) and the streaming path, or pin the
-streaming kernel with `taomate_h3_npu_attention`. CUDA graphs, the decode
-overlap and the FP8 activation kernel are CUDA-only and stay off.
+streaming attention runs `torch_npu.npu_fusion_attention`; pin the streaming kernel
+with `taomate_h3_npu_attention`. CUDA graphs, the decode overlap and the FP8
+activation kernel are CUDA-only and stay off.
+
+Leave `MINDIE_SD_FA_TYPE` unset on A5 devices. `ascend_laser_attention` selects
+MindIE-SD laser attention in both the base (teacher, token refiner) and the streaming
+path, but on A5 MindIE-SD remaps it to `fused_attn_score` and warns on every call.
+In the run above that setting took about 11.3 s per window instead of 8.6 s.
+
+That run measured about 8.6 s per five-second window at 480x864 (roughly 0.6x
+realtime): 3.4 s student denoise, 1.2 s clean commit, 0.45 s teacher, 1.6 s video
+decode and 1.8 s audio decode. Treat these as one eager BF16 measurement, not a
+tuned result.
+
+Known issue with vllm-ascend `0.19.1rc2.dev3349+g221fb096c`: while its custom operator
+vendor directory (`vllm_ascend/_cann_ops_custom/vendors/custom_transformer`) is on
+`ASCEND_CUSTOM_OPP_PATH`, the first HCCL collective fails with
+`RunAicpuCommInit ... get kernel failed` and the stage never starts. A four-rank
+`torch.distributed` broadcast reproduces it without any model. Moving that directory
+aside for the run let the server start, and TaoMate-H3 did not need those operators.
+The cause inside CANN is not established; other vllm-ascend builds were not tested.
 
 The engine performs a throwaway rollout before serving, including in eager mode when
 `ar_diffusion_kv_config.warmup_cudagraph: true`. Four windows cover the teacher's initial
@@ -252,7 +272,7 @@ the supplied YAML files enable additional optimizations.
 | `taomate_h3_vae_decoder_tile_overlap_min` | checkpoint: 64 | Minimum tile overlap, a nonnegative multiple of 16. The USP2 config uses 32. |
 | `taomate_h3_vae_stack_tiling` | false | Decode each rank's tiles as a batch to reduce peak memory. |
 | `taomate_h3_fp8_quant_cuda_op` | true | Use vLLM's CUDA activation-quantization kernel for FP8 linears. |
-| `taomate_h3_npu_attention` | `auto` | Ascend only: dense kernel of the streaming attention. `auto` uses laser attention when `MINDIE_SD_FA_TYPE=ascend_laser_attention` and `npu_fusion_attention` otherwise; `fa`, `laser` or `sdpa` pin it. |
+| `taomate_h3_npu_attention` | `auto` | Ascend only: dense kernel of the streaming attention. `auto` uses laser attention when `MINDIE_SD_FA_TYPE=ascend_laser_attention` and `npu_fusion_attention` otherwise; `fa`, `laser` or `sdpa` pin it. Laser is remapped and slower on A5 devices. |
 | `taomate_h3_log_timings` | false | Log phase/stage durations; adds device synchronizations. |
 | `taomate_h3_profile_chunk` / `taomate_h3_profile_dir` | unset / `/tmp/taomate_h3_profile` | Profile the selected chunk and write per-rank kernel tables and Chrome traces. |
 
