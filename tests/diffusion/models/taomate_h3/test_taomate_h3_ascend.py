@@ -21,6 +21,46 @@ def test_graph_replay_updates_inputs_and_preserves_previous_output():
     assert graph.captures == 1 and graph.replays == 2
 
 
+@pytest.mark.parametrize("kind", ["causal_gqa", "sdpa", "fused"])
+@torch.inference_mode()
+def test_attention_graph_replays_new_values(kind):
+    import torch_npu
+
+    from vllm_omni.diffusion.npu_graph import NPUGraphedForward
+
+    def attention(q, k, v):
+        if kind == "fused":
+            return torch_npu.npu_fusion_attention(q, k, v, 4, "BNSD", scale=0.125)[0]
+        return torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, scale=0.125, is_causal=kind == "causal_gqa", enable_gqa=kind == "causal_gqa"
+        )
+
+    graph = NPUGraphedForward(attention, device=torch.device("npu"))
+    for _ in range(2):
+        q = torch.randn(1, 4, 32, 64, device="npu", dtype=torch.bfloat16)
+        k = torch.randn(1, 2 if kind == "causal_gqa" else 4, 32, 64, device="npu", dtype=torch.bfloat16)
+        v = torch.randn_like(k)
+        expected = attention(q, k, v)
+        torch.testing.assert_close(graph(q=q, k=k, v=v), expected, rtol=0.02, atol=0.01)
+    assert graph.captures == 1 and graph.replays == 2 and graph.eager_calls == 0
+
+
+@torch.inference_mode()
+def test_graph_replay_owns_its_autocast_weights():
+    from vllm_omni.diffusion.npu_graph import NPUGraphedForward
+
+    layer = torch.nn.Linear(64, 64, bias=False, device="npu")
+    x = torch.randn(4, 64, device="npu")
+    graph = NPUGraphedForward(layer, device=torch.device("npu"))
+    with torch.autocast("npu", dtype=torch.float16):
+        expected = layer(x)  # Populate the enclosing scope's weight cache.
+        torch.testing.assert_close(graph(input=x), expected)
+    layer.weight.zero_()
+    with torch.autocast("npu", dtype=torch.float16):
+        torch.testing.assert_close(graph(input=x), torch.zeros_like(expected))
+    assert graph.captures == 1 and graph.replays == 2
+
+
 @torch.inference_mode()
 def test_per_channel_linear_matches_dequantized_operands():
     import torch_npu
