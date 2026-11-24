@@ -76,8 +76,7 @@ previously erased much of the small adapter delta and blurred the video.
 
 ### Ascend 950 (four NPUs, BF16)
 
-> This is the Ascend twin of the four-GPU BF16 configuration; the two-GPU FP8
-> configuration has no Ascend counterpart yet. The realtime configuration was run on
+> This is the Ascend twin of the four-GPU BF16 configuration. The realtime configuration was run on
 > four NPUs with an A5 software stack (CANN 9.2.1, torch_npu 2.10.0.post7, MindIE-SD
 > 3.2.0, vLLM 0.33.0): startup rollout and streaming requests completed with video and
 > audio. The output was checked by eye only, not against a CUDA reference, and the
@@ -100,8 +99,20 @@ vllm serve /path/to/MiniMax-H3/FL2VA --omni --trust-remote-code \
 
 Use `taomate_h3_usp4_full_request_npu.yaml` for the `/v1/videos` job API. The
 streaming attention runs `torch_npu.npu_fusion_attention`; pin the streaming kernel
-with `taomate_h3_npu_attention`. CUDA graphs, the decode overlap and the FP8
-activation kernel are CUDA-only and stay off.
+with `taomate_h3_npu_attention`. The optional teacher, text encoder, and video VAE graph flags
+(`taomate_h3_teacher_cuda_graph`, `taomate_h3_text_encoder_cuda_graph`, and
+`taomate_h3_vae_cuda_graph`) select ACL graph capture on NPU. The BF16 preset
+uses eager execution. Test each flag separately and check capture/replay counts
+for repeated shapes. Disable the host-digest AdaLN cache when testing teacher capture.
+`taomate_h3_decode_overlap` queues decode on NPU side streams. Compare the
+complete output (including the final flush) with a same-seed eager run.
+cuDNN autotuning is CUDA-specific.
+
+For experimental two-card E4M3 inference, use
+`vllm_omni/deploy/taomate_h3_usp2_realtime_npu.yaml` with the same command.
+It quantizes DiT weights per output channel and activations per token using
+Ascend 950 operators. LoRA stays unmerged. Validate per-layer numerical error,
+startup memory, and speech quality against BF16 before benchmarking.
 
 Leave `MINDIE_SD_FA_TYPE` unset on A5 devices. `ascend_laser_attention` selects
 MindIE-SD laser attention in both the base (teacher, token refiner) and the streaming

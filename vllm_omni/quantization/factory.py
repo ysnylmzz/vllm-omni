@@ -115,6 +115,12 @@ def _build_fp8(**kw: Any) -> QuantizationConfig:
     return DiffusionFp8Config(**kw)
 
 
+def _build_npu_fp8_per_channel(**kw: Any) -> QuantizationConfig:
+    from .npu_fp8_per_channel import NPUPerChannelFP8Config
+
+    return NPUPerChannelFP8Config(**kw)
+
+
 def _build_int8(**kw: Any) -> QuantizationConfig:
     """Lazy import for Int8 diffusion config (supports CUDA + NPU)."""
     from .int8_config import DiffusionInt8Config
@@ -217,6 +223,7 @@ def _build_torchao_float8_weight_only(**kw: Any) -> QuantizationConfig:
 
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "fp8": _build_fp8,
+    "npu_fp8_per_channel": _build_npu_fp8_per_channel,
     "int8": _build_int8,
     "convrot_int8": _build_convrot_int8,
     "convrot_int4": _build_convrot_int4,
