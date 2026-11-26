@@ -1010,8 +1010,7 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         started = time.perf_counter() if self._tm_log_timings else 0.0
         hidden, tags = super().encode_prompt(prepared)
         if self._tm_log_timings:
-            if hidden.is_cuda:
-                torch.accelerator.synchronize()
+            self._synchronize_device()
             logger.info("TaoMate-H3 prompt encode: %.3f s, %d tokens", time.perf_counter() - started, hidden.shape[0])
         return hidden, tags
 
@@ -1314,6 +1313,11 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         state.step_index = 0
         state.step_in_chunk = 0
 
+    def _synchronize_device(self) -> None:
+        """Wait for queued device work so stage timings cover it on every accelerator."""
+        if self.device.type != "cpu":
+            current_omni_platform.synchronize()
+
     def _start_profiler(self) -> Any:
         activities = [torch.profiler.ProfilerActivity.CPU]
         if self.device.type == "cuda":
@@ -1328,8 +1332,7 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         self._tm_profiler = None
         if profiler is None:
             return
-        if self.device.type == "cuda":
-            torch.accelerator.synchronize()
+        self._synchronize_device()
         profiler.__exit__(None, None, None)
         import os
 
@@ -1567,8 +1570,7 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
             phase_state.timings["denoise_launch"] = phase_state.timings.get("denoise_launch", 0.0) + (
                 time.perf_counter() - started
             )
-            if velocity_video.is_cuda:
-                torch.accelerator.synchronize()
+            self._synchronize_device()
         phase_state.timings["denoise"] = phase_state.timings.get("denoise", 0.0) + (time.perf_counter() - started)
         return velocity_video.float()
 
@@ -1683,8 +1685,8 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         except BaseException:
             session.history.rollback()
             raise
-        if self._tm_log_timings and torch.cuda.is_available():
-            torch.accelerator.synchronize()
+        if self._tm_log_timings:
+            self._synchronize_device()
         phase_state.timings["commit"] = time.perf_counter() - commit_started
 
         # Publish this phase: incremental video decode plus the aligned audio.
