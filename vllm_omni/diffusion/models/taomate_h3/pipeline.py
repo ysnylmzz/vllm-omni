@@ -680,7 +680,7 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         self._tm_lora_merge = bool(model_config.get("taomate_h3_lora_merge", False))
         # cuDNN autotuning for the fixed-shape convolutions of the VAE decode
         # (every window and tile has the same shape after the first request).
-        if bool(model_config.get("taomate_h3_cudnn_benchmark", False)):
+        if self.device.type == "cuda" and bool(model_config.get("taomate_h3_cudnn_benchmark", False)):
             torch.backends.cudnn.benchmark = True
             logger.info("TaoMate-H3: cudnn.benchmark enabled (taomate_h3_cudnn_benchmark)")
         if self._tm_cuda_graph_max_entries < 1:
@@ -837,7 +837,7 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         graph: GraphedForward | None = None
         if self._tm_teacher_cuda_graph:
             _, _, group = _ulysses_state()
-            graph = current_omni_platform.get_graphed_forward_cls()(
+            graph = self._graph_cls()(
                 self.transformer,
                 device=self.device,
                 max_entries=self._tm_cuda_graph_max_entries,
@@ -861,6 +861,13 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         self._tm_teacher = TaoMateAudioTeacher(self.transformer, manager=None, device=self.device, graph=graph)
         return loaded
 
+    def _graph_cls(self) -> type[GraphedForward]:
+        if self.device.type == "npu":
+            from vllm_omni.diffusion.npu_graph import NPUGraphedForward
+
+            return NPUGraphedForward
+        return current_omni_platform.get_graphed_forward_cls()
+
     def _tm_vae_graph(self) -> GraphedForward | None:
         """Lazily build the shared video-VAE tile decode graph and patch it onto the checkpoint model.
 
@@ -870,11 +877,11 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         The original bound method stays reachable through the shim's eager
         fallback inside GraphedForward.
         """
-        if not self._tm_vae_cuda_graph or self.device.type != "cuda":
+        if not self._tm_vae_cuda_graph or self.device.type not in ("cuda", "npu"):
             return None
         if self._tm_vae_decode_graph is None:
             _, _, group = _ulysses_state()
-            graph = GraphedForward(
+            graph = self._graph_cls()(
                 _KeywordTileDecode(self.video_vae.model.decode),
                 device=self.device,
                 max_entries=self._tm_cuda_graph_max_entries,
@@ -896,7 +903,7 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
             return None  # not an encoder TP rank
         group = getattr(self, "text_encoder_group", None)
         device_group = getattr(group, "device_group", None) if int(getattr(group, "world_size", 1)) > 1 else None
-        text_graph = current_omni_platform.get_graphed_forward_cls()(
+        text_graph = self._graph_cls()(
             GraphSafeTextEncode(encoder),
             device=self.device,
             max_entries=max(self._tm_cuda_graph_max_entries, 128),
@@ -1348,17 +1355,17 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         logger.info("TaoMate-H3 profiler: wrote %s_kernels.txt (%s)", stem, session_id)
 
     def _decode_stream(self) -> Any:
-        """The video decode's CUDA stream when the overlap is enabled on a CUDA device, else None."""
-        if not self._tm_decode_overlap or self.device.type != "cuda":
+        """Return the side stream for opt-in CUDA or NPU decode overlap."""
+        if not self._tm_decode_overlap or self.device.type not in ("cuda", "npu"):
             return None
         if self._tm_decode_stream is None:
-            self._tm_decode_stream = torch.cuda.Stream(device=self.device)
+            self._tm_decode_stream = torch.get_device_module(self.device).Stream(device=self.device)
         return self._tm_decode_stream
 
     def _audio_decode_stream(self) -> Any:
-        # Called on the output rank only, on the CUDA decode-overlap path.
+        # Called on the output rank only, on the decode-overlap path.
         if self._tm_audio_decode_stream is None:
-            self._tm_audio_decode_stream = torch.cuda.Stream(device=self.device)
+            self._tm_audio_decode_stream = torch.get_device_module(self.device).Stream(device=self.device)
         return self._tm_audio_decode_stream
 
     def _warm_teacher_shapes(self, session: _Session, request: _RequestState) -> None:
@@ -1627,8 +1634,8 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         if decode_stream is not None:
             # Queue the decode first, on its own stream: it waits for the clean
             # latents and then runs alongside the launch-bound commit forward.
-            decode_stream.wait_stream(torch.cuda.current_stream(self.device))
-            with torch.cuda.stream(decode_stream):
+            decode_stream.wait_stream(torch.get_device_module(self.device).current_stream(self.device))
+            with torch.get_device_module(self.device).stream(decode_stream):
                 latent.record_stream(decode_stream)
                 frame_start, frames_device = session.video_decoder.push_device(latent)
                 if final_chunk:
@@ -1645,14 +1652,14 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
                 # The shape is already known on the host; derive the exact audio sample range before fetching the video.
                 frame_count = 0 if frames_device is None else int(frames_device.shape[0])
                 audio_stream = self._audio_decode_stream()
-                audio_stream.wait_stream(torch.cuda.current_stream(self.device))
+                audio_stream.wait_stream(torch.get_device_module(self.device).current_stream(self.device))
                 audio_started = time.perf_counter()
                 # Ordering requirement: decode_range_device may rebind
                 # audio_decoder.latents to a trimmed contiguous copy allocated
                 # on this stream, so any later append (issued on the main
                 # stream) must stay behind the wait_stream after the fetch
                 # below, not just behind this record_stream.
-                with torch.cuda.stream(audio_stream):
+                with torch.get_device_module(self.device).stream(audio_stream):
                     session.audio_decoder.latents.record_stream(audio_stream)
                     audio_device = session.audio_decoder.decode_range_device(
                         samples_at_frame(frame_start), samples_at_frame(frame_start + frame_count)
@@ -1699,10 +1706,10 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         session.prepare_ahead(completed_phase_index=phase.index)
         phase_state.timings["prepare_ahead"] = time.perf_counter() - ahead_started
         if decode_stream is not None:
-            with torch.cuda.stream(decode_stream):
+            with torch.get_device_module(self.device).stream(decode_stream):
                 frames = session.video_decoder.to_host(frames_device)
             # Later work on the main stream may reuse the decoder's buffers.
-            torch.cuda.current_stream(self.device).wait_stream(decode_stream)
+            torch.get_device_module(self.device).current_stream(self.device).wait_stream(decode_stream)
         else:
             frames = session.video_decoder.to_host(frames_device)
         phase_state.timings["video_decode"] = time.perf_counter() - decode_started
@@ -1725,9 +1732,9 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
                     samples_at_frame(frame_start), samples_at_frame(frame_start + num_frames)
                 )
             else:
-                with torch.cuda.stream(audio_stream):
+                with torch.get_device_module(self.device).stream(audio_stream):
                     audio = audio_device.cpu().numpy()
-                torch.cuda.current_stream(self.device).wait_stream(audio_stream)
+                torch.get_device_module(self.device).current_stream(self.device).wait_stream(audio_stream)
         else:
             # The executor returns rank 0's output; peers keep the decoder
             # timeline but skip the waveform decode.

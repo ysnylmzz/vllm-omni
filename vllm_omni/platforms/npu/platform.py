@@ -491,6 +491,11 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     def get_profiler_cls(cls) -> str:
         return "vllm_omni.platforms.npu.profiler.NPUTorchProfilerWrapper"
 
+    def is_graph_capturing(self) -> bool:
+        from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
+
+        return NPUExactGraphRunner._stream_is_capturing()
+
     @classmethod
     def get_graph_wrapper_cls(cls) -> type:
         from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
