@@ -1,4 +1,4 @@
-# TaoMate-H3 full-request inference on Ascend 950 (4 NPUs): USP4, BF16 weights.
+# TaoMate-H3 full-request inference on Ascend 950PR (4 NPUs): USP4, BF16 weights.
 # The NPU twin of taomate_h3_usp4_full_request.yaml; see recipes/TaoLiveAIGC/TaoMate-H3.md.
 
 pipeline: taomate_h3

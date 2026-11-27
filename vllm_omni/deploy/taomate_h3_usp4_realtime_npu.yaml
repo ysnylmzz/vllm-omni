@@ -1,4 +1,4 @@
-# TaoMate-H3 streaming on Ascend 950 (4 NPUs): USP4, tensor parallel 1, BF16 weights.
+# TaoMate-H3 streaming on Ascend 950PR (4 NPUs): USP4, tensor parallel 1, BF16 weights.
 # The NPU twin of taomate_h3_usp4_realtime.yaml; see recipes/TaoLiveAIGC/TaoMate-H3.md.
 # Warmup runs four five-second windows before serving.
 

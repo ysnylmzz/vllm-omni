@@ -76,8 +76,7 @@ previously erased much of the small adapter delta and blurred the video.
 
 ### Ascend 950PR (four NPUs, BF16)
 
-The four-device BF16 WebSocket preset was tested on Ascend 950PR at
-[`8b347a6f9`](https://github.com/ysnylmzz/vllm-omni/commit/8b347a6f96c0610c7ff6bdff16217e6f6fce75ee)
+The four-device BF16 WebSocket preset was tested on Ascend 950PR
 using the `quay.io/ascend/vllm-omni:v0.34.0-a5` image (vLLM 0.34.0+empty,
 CANN toolkit 9.3.0, torch_npu 2.10.0.post7, MindIE-SD 3.2.0).
 For one 480×864 request at 24 fps, the client received four media chunks and a
@@ -108,12 +107,11 @@ activation kernel are CUDA-only and stay off.
 Leave `MINDIE_SD_FA_TYPE` unset on A5 devices. `ascend_laser_attention` selects
 MindIE-SD laser attention in both the base (teacher, token refiner) and the streaming
 path, but on A5 MindIE-SD remaps it to `fused_attn_score` and warns on every call.
-In the run above that setting took about 11.3 s per window instead of 8.6 s.
-
-That run measured about 8.6 s per five-second window at 480x864 (roughly 0.6x
-realtime): 3.4 s student denoise, 1.2 s clean commit, 0.45 s teacher, 1.6 s video
-decode and 1.8 s audio decode. Treat these as one eager BF16 measurement, not a
-tuned result.
+In an earlier eager BF16 run on vLLM 0.33 at 480×864, a five-second window took
+about 8.6 s with the default fusion attention and 11.3 s with laser selected.
+Stage timings with the default included 3.4 s for student denoising, 1.2 s for
+clean commit, 0.45 s for the teacher, 1.6 s for video decode and 1.8 s for
+audio decode. The vLLM 0.34 measurement above reports end-to-end client time.
 
 Known issue with vllm-ascend `0.19.1rc2.dev3349+g221fb096c`: while its custom operator
 vendor directory (`vllm_ascend/_cann_ops_custom/vendors/custom_transformer`) is on
