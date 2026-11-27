@@ -74,14 +74,16 @@ Do not increase the decoder tile size: 384/480 px tiles previously produced a vi
 16 px lattice. Keep `taomate_h3_lora_merge: false`: merging into FP8 student weights
 previously erased much of the small adapter delta and blurred the video.
 
-### Ascend 950 (four NPUs, BF16)
+### Ascend 950PR (four NPUs, BF16)
 
-> This is the Ascend twin of the four-GPU BF16 configuration; the two-GPU FP8
-> configuration has no Ascend counterpart yet. The realtime configuration was run on
-> four NPUs with an A5 software stack (CANN 9.2.1, torch_npu 2.10.0.post7, MindIE-SD
-> 3.2.0, vLLM 0.33.0): startup rollout and streaming requests completed with video and
-> audio. The output was checked by eye only, not against a CUDA reference, and the
-> full-request configuration was not run.
+The four-device BF16 WebSocket preset was tested on Ascend 950PR at
+[`8b347a6f9`](https://github.com/ysnylmzz/vllm-omni/commit/8b347a6f96c0610c7ff6bdff16217e6f6fce75ee)
+using the `quay.io/ascend/vllm-omni:v0.34.0-a5` image (vLLM 0.34.0+empty,
+CANN toolkit 9.3.0, torch_npu 2.10.0.post7, MindIE-SD 3.2.0).
+For one 480×864 request at 24 fps, the client received four media chunks and a
+trailer, decoded all 124 frames and saved the MP4 with audio. Generating 5.17 s
+of content took 8.5 s end to end (0.61× realtime). Full-request serving and
+CUDA output parity remain unverified on this revision.
 
 Prepare the environment as for the base model
 ([MiniMax-H3-NPU-950PR.md](../MiniMaxAI/MiniMax-H3-NPU-950PR.md)): the A5 vLLM-Omni
